@@ -1,0 +1,283 @@
+Kubernetes NodePools explained
+
+Introduction
+This article will explain and show the use cases for using NodePools in Kubernetes:
+* What are nodepools ?
+* What are System and User nodepools ?
+* How to schedule application pods on a specific nodepool using Labels and nodeSelector ?
+* How to allow only specific application pods to be scheduled on a nodepool using Taints and Tolerations ?
+* How nodepools could be used to reduce the risk behind upgrading a cluster ?
+* How to set auto scalability for each nodepool ?
+
+In a Kubernetes cluster, the containers are deployed as pods into VMs called worker or agent nodes. 
+These nodes are identical as they use the same VM size or SKU.
+This was just fine until we realized we might need nodes with different SKU for the following reasons:
+
+* Prefer to deploy Kubernetes system pods (like CoreDNS, metrics-server, Gatekeeper addon) and application pods on different dedicated nodes.
+  This is in order to prevent misconfigured or rogue application pods to accidentally killing system pods.
+
+* Some pods requires either CPU or Memory intensive and optimized VMs.
+
+* Some pods are processing ML/AI algorithms and needs GPU enabled VMs. 
+  These GPU enabled VMs should be used only by certain pods as they are expensive.
+
+* Some pods/jobs wants to leverage spot/preemptible VMs to reduce the cost.
+
+* Some pods running legacy Windows applications requires Windows Containers available with Windows VMs.
+
+* Some teams wants to physically isolate their non-production environments (dev, test, QA, staging..) within the same cluster.
+  This is because it is easier to manage less clusters. 
+  These teams realized that logical isolation with namespaces is not enough.
+
+These reasons led to the creation of heteregeneous nodes within the cluster. 
+To make it easier to manage these nodes, Kubernetes introduced the NodePool.
+The nodepool is a group of nodes that share the same configuration (CPU, Memory, Networking, OS, maximum number of pods..).
+By default one single (system) nodepool is created within the cluster.
+However we can add nodepools during or after cluster creation.
+We can also remove these nodepools at anytime.
+There are 2 types of nodepools:
+
+* System nodepool: used to preferebly deploy system pods.
+  Kubernetes could have multiple system nodepools. 
+  At least one nodepool is required with at least one single node.
+  System nodepools must run only on Linux (no support for Windows).
+
+* User nodepool: used to preferebly deploy application pods.
+  Kubernetes could have multiple user nodepools or none.
+  All user nodepools could scale down to zero nodes.
+  A user nodepool could run on Linux or Windows nodes.
+
+Nodepool might have some 'small' different configurations with different cloud providers.
+This article will focus on Azure Kubernetes Service (AKS). 
+Let's see a demo on how that works with AKS.
+
+1) Demo time
+
+We'll start by creating a new AKS cluster using the Azure CLI:
+
+az group create -n aks-cluster -l westeurope
+az aks create -n aks-cluster -g aks-cluster
+
+This will create a new cluster with one single nodepool called agentpool.
+
+kubectl get nodes
+ $ kubectl get nodes
+NAME                                   STATUS   ROLES   AGE    VERSION
+aks-agentpool-20474252-vmss000008      Ready    agent   3h1m   v1.20.7
+aks-agentpool-20474252-vmss000009      Ready    agent   3h1m   v1.20.7
+aks-agentpool-20474252-vmss00000a      Ready    agent   3h1m   v1.20.7
+
+This node pool is of type System. 
+It doesn't have any taints.
+
+$ kubectl get nodes -o json | jq '.items[].spec.taints'
+null
+null
+null
+
+But it have some labels for it's nodes.
+Let's show the labels with the following command:
+
+$ kubectl get nodes -o json | jq '.items[].metadata.labels'
+{
+  "agentpool": "agentpool",
+  "beta.kubernetes.io/arch": "amd64",
+  "beta.kubernetes.io/instance-type": "Standard_D2s_v4",
+  "beta.kubernetes.io/os": "linux",
+  "failure-domain.beta.kubernetes.io/region": "westeurope",
+  "failure-domain.beta.kubernetes.io/zone": "westeurope-2",
+  "kubernetes.azure.com/cluster": "MC_aks-cluster_aks-cluster_westeurope",
+  "kubernetes.azure.com/mode": "system",
+  "kubernetes.azure.com/node-image-version": "AKSUbuntu-1804gen2containerd-2021.05.19",
+  "kubernetes.azure.com/role": "agent",
+  "kubernetes.io/arch": "amd64",
+  "kubernetes.io/hostname": "aks-agentpool-20474252-vmss000008",
+  "kubernetes.io/os": "linux",
+  "kubernetes.io/role": "agent",
+  "node-role.kubernetes.io/agent": "",
+  "node.kubernetes.io/instance-type": "Standard_D2s_v4",
+  "storageprofile": "managed",
+  "storagetier": "Premium_LRS",
+  "topology.kubernetes.io/region": "westeurope",
+  "topology.kubernetes.io/zone": "westeurope-2"
+}
+
+
+We'll add a new user nodepool. That could be done using the following command.
+
+az aks nodepool add `
+       --resource-group aks-cluster `
+       --cluster-name aks-cluster `
+       --name appsnodepool `
+       --node-count 5 `
+       --node-vm-size Standard_B2ms `
+       --kubernetes-version 1.20.7 `
+       --max-pods 30 `
+       --priority Regular `
+       --zones 1, 2, 3 `
+       --mode User
+
+Note:
+Note the --priority parameter that could be used with value "Spot" in order to create Spot VM instances. 
+Spot instances are used for cost optimisation.
+
+This could be also done with the Azure portal. Go to the cluster, search for Nodepools in the left blade, then click 'add nodepool'.
+
+We can then view the 2 nodepools from the portal or command line.
+
+$ az aks nodepool list --cluster-name aks-cluster --resource-group aks-cluster -o table
+Name          OsType    VmSize           Count    MaxPods    ProvisioningState    Mode
+------------  --------  ---------------  -------  ---------  -------------------  ------
+agentpool     Linux     Standard_D2s_v4  3        110        Succeeded            System
+appsnodepool  Linux     Standard_B2ms    5        30         Succeeded            User
+
+Deploy an application into a specific nodepool
+By default, if we deploy a pod into the cluster, it could be deployed into any of the 2 nodepools.
+However, we can choose to target a specific nodepool using Labels on nodepools and nodeSelector from deployment/pods.
+Each nodepool have its own set of labels like the agentpool name ("agentpool": "appsnodepool",).
+We can use the label to target the nodes by using nodeSelector from the deployment file.
+
+Let's show the labels of one of one of the user nodepool nodes with the following command.
+Make sure to replace the node name.
+
+$ kubectl get node aks-appsnodepool-20474252-vmss000001 -o json | jq '.metadata.labels'
+{
+  "agentpool": "appsnodepool",
+  "beta.kubernetes.io/arch": "amd64",
+  "beta.kubernetes.io/instance-type": "Standard_B2ms",
+  "beta.kubernetes.io/os": "linux",
+  "failure-domain.beta.kubernetes.io/region": "westeurope",
+  "failure-domain.beta.kubernetes.io/zone": "westeurope-3",
+  "kubernetes.azure.com/cluster": "MC_aks-cluster_aks-cluster_westeurope",
+  "kubernetes.azure.com/node-image-version": "AKSUbuntu-1804gen2containerd-2021.05.19",
+  "kubernetes.azure.com/role": "agent",
+  "kubernetes.io/arch": "amd64",
+  "kubernetes.io/hostname": "aks-appsnodepool-20474252-vmss000001",
+  "kubernetes.io/os": "linux",
+  "kubernetes.io/role": "agent",
+  "node-role.kubernetes.io/agent": "",
+  "node.kubernetes.io/instance-type": "Standard_B2ms",
+  "storageprofile": "managed",
+  "storagetier": "Premium_LRS",
+  "topology.kubernetes.io/region": "westeurope",
+  "topology.kubernetes.io/zone": "westeurope-3"
+}
+
+Let's consider the following yaml deployment using the nodeSelector of pool name:
+
+# app-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deploy
+spec:
+  replicas: 100
+  selector:
+    matchLabels:
+      app: app-deploy
+  template:
+    metadata:
+      labels:
+        app: app-deploy
+    spec:
+      containers:
+      - image: nginx
+        name: nginx
+      nodeSelector:
+        agentpool: appsnodepool
+
+Let's deploy the yaml file. 
+
+$ kubectl apply -f app-deploy.yaml
+deployment.apps/app-deploy created
+
+Let's get the pods' nodes. Note that all pods are scheduled into the user appsnodepool and not to system agentpool.
+
+$ kubectl get pods -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP             NODE                                   NOMINATED NODE   READINESS GATES
+app-deploy-56c87f665-2ng8f   1/1     Running   0          78s   10.240.1.87    aks-appsnodepool-20474252-vmss000000   <none>           <none>
+app-deploy-56c87f665-2z6pf   1/1     Running   0          76s   10.240.1.186   aks-appsnodepool-20474252-vmss000003   <none>           <none>
+app-deploy-56c87f665-42587   1/1     Running   0          79s   10.240.1.177   aks-appsnodepool-20474252-vmss000003   <none>           <none>
+app-deploy-56c87f665-4jltt   1/1     Running   0          76s   10.240.1.221   aks-appsnodepool-20474252-vmss000004   <none>           <none>
+app-deploy-56c87f665-4tvmf   1/1     Running   0          79s   10.240.1.100   aks-appsnodepool-20474252-vmss000000   <none>           <none>
+
+
+Now the application pods will be deployed only to the user nodepool.
+However, the system pods could be rescheduled to the user nodepool.
+We don't want that to happen as we want to physically isolate these critical system pods.
+The solution here is to use Taints on the nodepool and Tolerations on the pods.
+System pods like CoreDNS already have default tolerations like CriticalAddonsOnly.
+
+$ kubectl get deployment coredns -n kube-system -o json | jq ".spec.template.spec.tolerations"
+[
+  {
+    "effect": "NoSchedule",
+    "key": "node-role.kubernetes.io/master"
+  },
+  {
+    "key": "CriticalAddonsOnly",
+    "operator": "Exists"
+  },
+  {
+    "effect": "NoExecute",
+    "key": "node.kubernetes.io/unreachable",
+    "operator": "Exists",
+    "tolerationSeconds": 30
+  },
+  {
+    "effect": "NoExecute",
+    "key": "node.kubernetes.io/not-ready",
+    "operator": "Exists",
+    "tolerationSeconds": 30
+  }
+]
+
+To allow these system pods to be deployed only to system nodepool, we need to make sure the system nodepool defines a taint with the same name.
+As seen earlier, the system nodepool doesn't have any taints by default. 
+Unfortunately we can add taints only during nodepool creation, not after.
+So let's create a new system nodepool with taint (CriticalAddonsOnly=true:NoSchedule).
+
+az aks nodepool add `
+    --resource-group aks-cluster `
+    --cluster-name aks-cluster `
+    --name systempool `
+    --node-count 3 `
+    --node-vm-size Standard_D2s_v4 `
+    --kubernetes-version 1.20.7 `
+    --max-pods 30 `
+    --priority Regular `
+    --zones 1, 2, 3 `
+    --node-taints CriticalAddonsOnly=true:NoSchedule `
+    --mode System
+
+System pods will still run on old system nodepool until we drain that nodepoll or delete it.
+Lets go to delete it from the portal or the following command.
+
+$ az aks nodepool delete --cluster-name aks-cluster --resource-group aks-cluster --name agentpool
+
+Lets now verify that system pods are deployed into the new system nodepool nodes:
+
+$ kubectl get pods -n kube-system -o wide
+NAME                                    READY   STATUS    RESTARTS   AGE     IP             NODE
+coredns-9d6c6c99b-7cxcf                 1/1     Running   0          3m4s    10.240.2.61    aks-systempool-20474252-vmss000002
+coredns-9d6c6c99b-hq295                 1/1     Running   0          3m10s   10.240.1.253   aks-systempool-20474252-vmss000000
+coredns-9d6c6c99b-nqqbq                 1/1     Running   0          3m10s   10.240.2.33    aks-systempool-20474252-vmss000001
+coredns-autoscaler-599949fd86-7q9fb     1/1     Running   0          3m9s    10.240.2.53    aks-systempool-20474252-vmss000002
+metrics-server-77c8679d7d-7pgpb         1/1     Running   0          3m10s   10.240.1.237   aks-systempool-20474252-vmss000000
+
+
+NodePools could be used to upgrade the cluster with less risk
+Upgrading the entire clsuter (control plane and all nodepools) might be a risky operation.
+Nodepols could be leveraged to reduce thi risk. 
+Instead of upgrading the nodepool, we proceed with blue/green upgrade:
+
+1) Upgrade only the control plane to the newer version
+2) Create a new nodepool with the newer version
+3) Deploy the application pods in the newer nodepool
+4) Verify the application works fine
+5) Delete the old nodepool
+
+
+Resources:
+https://docs.microsoft.com/en-us/azure/aks/use-system-pools
+https://docs.microsoft.com/en-us/azure/aks/use-multiple-node-pools
